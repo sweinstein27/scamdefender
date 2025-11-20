@@ -1,6 +1,9 @@
 import Tesseract from "tesseract.js";
-import pdfParse from "pdf-parse";
 import { fileTypeFromBuffer } from "file-type";
+import { createRequire } from "module";
+
+const require = createRequire(import.meta.url);
+const pdfParse = require("pdf-parse");
 
 const URL_REGEX = /https?:\/\/[^\s"')]+/gi;
 
