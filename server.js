@@ -10,7 +10,7 @@ const PORT = process.env.PORT || 8080;
 const CORS_ORIGIN = process.env.CORS_ORIGIN || "*";
 
 app.use(helmet());
-app.use(bodyParser.json({ limit: "300kb" }));
+app.use(bodyParser.json({ limit: "5mb" }));
 app.use(rateLimit({ windowMs: 60_000, max: 120 }));
 
 app.use((req, res, next) => {
