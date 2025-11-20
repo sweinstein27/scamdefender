@@ -1,0 +1,11 @@
+version: "3.9"
+services:
+  api:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - IPQS_KEY=${IPQS_KEY}
+      - CORS_ORIGIN=*
+    restart: unless-stopped
