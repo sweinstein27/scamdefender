@@ -27,6 +27,7 @@ const API_KEYS = (process.env.API_KEYS || "")
   .filter(Boolean);
 
 const FREE_DAILY_LIMIT = Number(process.env.FREE_DAILY_LIMIT || "500");
+const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
 
 const db = new pg.Pool({
   connectionString: process.env.DATABASE_URL
@@ -57,7 +58,7 @@ app.use(
   })
 );
 
-// IMPORTANT: CORS MUST COME BEFORE ALL ROUTES INCLUDING /auth
+// CORS must come before all routes
 app.use(
   cors({
     origin: CORS_ORIGIN === "*" ? "*" : [CORS_ORIGIN],
@@ -71,8 +72,7 @@ app.options("*", cors());
 
 app.use(bodyParser.json({ limit: "5mb" }));
 
-// Mount authentication routes
-// These become:
+// Authentication routes
 //   POST /auth/signup
 //   POST /auth/login
 app.use("/auth", authRoutes);
@@ -130,7 +130,7 @@ app.get("/healthz", (req, res) => {
 });
 
 // ============================================================================
-// URL + TEXT SCAN
+// INTERNAL URL CHECK  v1
 // ============================================================================
 
 app.post("/v1/check", authAndMeter, async (req, res) => {
@@ -165,6 +165,51 @@ app.post("/v1/check", authAndMeter, async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error("Error in /v1/check:", err);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+// ============================================================================
+// PUBLIC URL CHECK  used by frontend at /api/public/check
+// ============================================================================
+
+app.post("/api/public/check", async (req, res) => {
+  try {
+    const { input_type = "url", content, source, client_id } = req.body || {};
+    if (!content) return res.status(400).json({ error: "missing content" });
+
+    const result = await ipqsUrlCheck(content, { strictness: 1 });
+
+    // api_key info is null because this is public usage
+    await db.query(
+      `INSERT INTO scans
+       (input_type, content_excerpt, file_name, mime_type,
+        api_key, day_count, total_count,
+        verdict, confidence, evidence, next_steps, meta)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
+        input_type,
+        String(content).slice(0, 200),
+        null,
+        null,
+        null,
+        null,
+        null,
+        result.verdict,
+        result.confidence,
+        JSON.stringify(result.evidence),
+        JSON.stringify(result.next_steps),
+        JSON.stringify({
+          ...(result.meta || {}),
+          source: source || "public_api",
+          client_id: client_id || null
+        })
+      ]
+    );
+
+    res.json(result);
+  } catch (err) {
+    console.error("Error in /api/public/check:", err);
     res.status(500).json({ error: "internal error" });
   }
 });
@@ -210,7 +255,7 @@ app.post("/v1/check_email", authAndMeter, async (req, res) => {
 });
 
 // ============================================================================
-// FILE CHECK (SCREENSHOTS + PDFs) — your original logic preserved
+// FILE CHECK  screenshots and PDF files
 // ============================================================================
 
 app.post("/v1/check_file", authAndMeter, async (req, res) => {
@@ -355,7 +400,7 @@ app.post("/v1/check_file", authAndMeter, async (req, res) => {
       return res.json(response);
     }
 
-    // Fallback: heuristic scan with no URLs
+    // Fallback heuristic when no URLs extracted
     const lower = text.toLowerCase();
     const evidence = [`file type ${mime}`, "no URLs detected"];
     let verdict = "safe";
@@ -402,7 +447,7 @@ app.post("/v1/check_file", authAndMeter, async (req, res) => {
         client_id: client_id || null
       },
       scan_id: `file_${Date.now().toString(36)}`
-    };
+    );
 
     await db.query(
       `INSERT INTO scans
@@ -434,10 +479,63 @@ app.post("/v1/check_file", authAndMeter, async (req, res) => {
 });
 
 // ============================================================================
-// ADMIN ROUTE (unchanged)
+// SIMPLE ADMIN ROUTES
 // ============================================================================
 
-// keep the entire admin block from your original file here
+// Protect with ADMIN_TOKEN header
+function requireAdmin(req, res, next) {
+  if (!ADMIN_TOKEN) {
+    return res.status(403).json({ error: "admin disabled" });
+  }
+  const token = req.header("x-admin-token");
+  if (!token || token !== ADMIN_TOKEN) {
+    return res.status(401).json({ error: "unauthorized" });
+  }
+  next();
+}
+
+// Recent scans
+app.get("/admin/scans", requireAdmin, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id,
+              created_at,
+              input_type,
+              content_excerpt,
+              file_name,
+              mime_type,
+              api_key,
+              day_count,
+              total_count,
+              verdict,
+              confidence,
+              evidence,
+              next_steps,
+              meta
+       FROM scans
+       ORDER BY created_at DESC
+       LIMIT 200`
+    );
+    res.json({ scans: rows });
+  } catch (err) {
+    console.error("Error in /admin/scans:", err);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+// In memory API key usage snapshot
+app.get("/admin/usage", requireAdmin, (req, res) => {
+  const usage = [];
+  for (const [key, value] of keyUsage.entries()) {
+    usage.push({
+      api_key: key,
+      day: value.day,
+      dayCount: value.dayCount,
+      total: value.total
+    });
+  }
+  res.json({ usage });
+});
 
 // ============================================================================
 // START SERVER
