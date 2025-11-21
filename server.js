@@ -216,7 +216,7 @@ function meterUser(req, res, next) {
     req.user.id || req.user.user_id || req.user.sub || "unknown_user";
   const key = String(userId);
 
-  let usage = publicUsage.get(key);
+  let usage = userUsage.get(key);
   if (!usage || usage.day !== today) {
     usage = {
       day: today,
@@ -298,57 +298,6 @@ app.post("/v1/user/check", requireUser, meterUser, async (req, res) => {
     res.json(result);
   } catch (err) {
     console.error("Error in /v1/user/check:", err);
-    res.status(500).json({ error: "internal error" });
-  }
-});
-
-// ============================================================================
-// PUBLIC URL CHECK  used by frontend at /api/public/check
-// ============================================================================
-
-app.post("/api/public/check", async (req, res) => {
-  try {
-    const { input_type = "url", content, source, client_id } = req.body || {};
-    if (!content) return res.status(400).json({ error: "missing content" });
-
-    const ip = getClientIp(req);
-    const today = todayString();
-
-    let usage = publicUsage.get(ip);
-    if (!usage || usage.day !== today) {
-      usage = {
-        day: today,
-        dayCount: 0,
-        total: usage?.total ?? 0
-      };
-    }
-
-    usage.dayCount += 1;
-    usage.total += 1;
-
-    publicUsage.set(ip, usage);
-
-    if (usage.dayCount > PUBLIC_DAILY_LIMIT) {
-      return res.status(429).json({
-        error: "public daily limit exceeded",
-        dayCount: usage.dayCount,
-        limit: PUBLIC_DAILY_LIMIT
-      });
-    }
-
-    const result = await performAndLogUrlScan({
-      input_type,
-      content,
-      source,
-      client_id,
-      apiKey: null,
-      apiUsage: usage,
-      defaultSource: "public_api"
-    });
-
-    res.json(result);
-  } catch (err) {
-    console.error("Error in /api/public/check:", err);
     res.status(500).json({ error: "internal error" });
   }
 });
@@ -637,6 +586,29 @@ app.post("/api/public/check", async (req, res) => {
       return res.status(400).json({ error: "missing input_type" });
     }
 
+    // Per-IP public rate limiting
+    const ip = getClientIp(req);
+    const today = todayString();
+    let usage = publicUsage.get(ip);
+    if (!usage || usage.day !== today) {
+      usage = {
+        day: today,
+        dayCount: 0,
+        total: usage?.total ?? 0
+      };
+    }
+    usage.dayCount += 1;
+    usage.total += 1;
+    publicUsage.set(ip, usage);
+
+    if (usage.dayCount > PUBLIC_DAILY_LIMIT) {
+      return res.status(429).json({
+        error: "public daily limit exceeded",
+        dayCount: usage.dayCount,
+        limit: PUBLIC_DAILY_LIMIT
+      });
+    }
+
     // ------------------------------------------------------------------------
     // FILE INPUT  mirrors /v1/check_file but api_key fields are null
     // ------------------------------------------------------------------------
@@ -693,8 +665,8 @@ app.post("/api/public/check", async (req, res) => {
             filename || null,
             mime,
             null,
-            null,
-            null,
+            usage.dayCount,
+            usage.total,
             response.verdict,
             response.confidence,
             JSON.stringify(response.evidence),
@@ -769,8 +741,8 @@ app.post("/api/public/check", async (req, res) => {
             filename || null,
             mime,
             null,
-            null,
-            null,
+            usage.dayCount,
+            usage.total,
             response.verdict,
             response.confidence,
             JSON.stringify(response.evidence),
@@ -843,8 +815,8 @@ app.post("/api/public/check", async (req, res) => {
           filename || null,
           mime,
           null,
-          null,
-          null,
+          usage.dayCount,
+          usage.total,
           response.verdict,
           response.confidence,
           JSON.stringify(response.evidence),
@@ -879,8 +851,8 @@ app.post("/api/public/check", async (req, res) => {
           null,
           null,
           null,
-          null,
-          null,
+          usage.dayCount,
+          usage.total,
           result.verdict,
           result.confidence,
           JSON.stringify(result.evidence),
@@ -913,8 +885,8 @@ app.post("/api/public/check", async (req, res) => {
         null,
         null,
         null,
-        null,
-        null,
+        usage.dayCount,
+        usage.total,
         result.verdict,
         result.confidence,
         JSON.stringify(result.evidence),
@@ -933,7 +905,6 @@ app.post("/api/public/check", async (req, res) => {
     res.status(500).json({ error: "internal error" });
   }
 });
-
 // ============================================================================
 // SIMPLE ADMIN ROUTES
 // ============================================================================
