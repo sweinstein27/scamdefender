@@ -4,6 +4,7 @@ import rateLimit from "express-rate-limit";
 import bodyParser from "body-parser";
 import cors from "cors";
 import pg from "pg";
+import jwt from "jsonwebtoken";
 
 import { ipqsUrlCheck, ipqsEmailCheck } from "./ipqs.js";
 import {
@@ -28,15 +29,34 @@ const API_KEYS = (process.env.API_KEYS || "")
 
 const FREE_DAILY_LIMIT = Number(process.env.FREE_DAILY_LIMIT || "500");
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null;
+const PUBLIC_DAILY_LIMIT = Number(process.env.PUBLIC_DAILY_LIMIT || "50");
+const USER_DAILY_LIMIT = Number(process.env.USER_DAILY_LIMIT || "500");
+const JWT_SECRET = process.env.JWT_SECRET || null;
 
 const db = new pg.Pool({
   connectionString: process.env.DATABASE_URL
 });
 
 const keyUsage = new Map();
+const publicUsage = new Map();
+const userUsage = new Map();
 
 function todayString() {
   return new Date().toISOString().slice(0, 10);
+}
+
+function getClientIp(req) {
+  const xff = req.header("x-forwarded-for");
+  if (xff) {
+    const first = xff.split(",")[0].trim();
+    if (first) return first;
+  }
+  return (
+    req.ip ||
+    req.connection?.remoteAddress ||
+    req.socket?.remoteAddress ||
+    "unknown"
+  );
 }
 
 // ============================================================================
@@ -121,6 +141,107 @@ function authAndMeter(req, res, next) {
   next();
 }
 
+async function performAndLogUrlScan({
+  input_type,
+  content,
+  source,
+  client_id,
+  apiKey,
+  apiUsage,
+  defaultSource,
+  metaExtra
+}) {
+  const result = await ipqsUrlCheck(content, { strictness: 1 });
+
+  await db.query(
+    `INSERT INTO scans
+       (input_type, content_excerpt, file_name, mime_type,
+        api_key, day_count, total_count,
+        verdict, confidence, evidence, next_steps, meta)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+    [
+      input_type,
+      String(content).slice(0, 200),
+      null,
+      null,
+      apiKey ?? null,
+      apiUsage?.dayCount ?? null,
+      apiUsage?.total ?? null,
+      result.verdict,
+      result.confidence,
+      JSON.stringify(result.evidence),
+      JSON.stringify(result.next_steps),
+      JSON.stringify({
+        ...(result.meta || {}),
+        ...(metaExtra || {}),
+        source: source || defaultSource || null,
+        client_id: client_id || null
+      })
+    ]
+  );
+
+  return result;
+}
+
+function requireUser(req, res, next) {
+  if (!JWT_SECRET) {
+    return res.status(500).json({ error: "auth disabled" });
+  }
+
+  const authHeader = req.header("Authorization") || "";
+  const parts = authHeader.split(" ");
+  if (parts.length !== 2 || parts[0] !== "Bearer") {
+    return res.status(401).json({ error: "missing or invalid token" });
+  }
+
+  const token = parts[1];
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+    req.user = payload;
+    next();
+  } catch (err) {
+    console.error("JWT verification failed:", err);
+    return res.status(401).json({ error: "invalid token" });
+  }
+}
+
+function meterUser(req, res, next) {
+  if (!req.user) {
+    return res.status(401).json({ error: "unauthenticated" });
+  }
+
+  const today = todayString();
+  const userId =
+    req.user.id || req.user.user_id || req.user.sub || "unknown_user";
+  const key = String(userId);
+
+  let usage = publicUsage.get(key);
+  if (!usage || usage.day !== today) {
+    usage = {
+      day: today,
+      dayCount: 0,
+      total: usage?.total ?? 0
+    };
+  }
+
+  usage.dayCount += 1;
+  usage.total += 1;
+
+  userUsage.set(key, usage);
+
+  if (usage.dayCount > USER_DAILY_LIMIT) {
+    return res.status(429).json({
+      error: "daily user limit exceeded",
+      dayCount: usage.dayCount,
+      limit: USER_DAILY_LIMIT
+    });
+  }
+
+  req.userUsage = usage;
+  next();
+}
+
 // ============================================================================
 // HEALTH CHECK
 // ============================================================================
@@ -138,33 +259,45 @@ app.post("/v1/check", authAndMeter, async (req, res) => {
     const { input_type = "url", content, source, client_id } = req.body || {};
     if (!content) return res.status(400).json({ error: "missing content" });
 
-    const result = await ipqsUrlCheck(content, { strictness: 1 });
-
-    await db.query(
-      `INSERT INTO scans
-       (input_type, content_excerpt, file_name, mime_type,
-        api_key, day_count, total_count,
-        verdict, confidence, evidence, next_steps, meta)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-      [
-        input_type,
-        String(content).slice(0, 200),
-        null,
-        null,
-        req.apiKey,
-        req.apiUsage?.dayCount ?? null,
-        req.apiUsage?.total ?? null,
-        result.verdict,
-        result.confidence,
-        JSON.stringify(result.evidence),
-        JSON.stringify(result.next_steps),
-        JSON.stringify({ ...(result.meta || {}), source, client_id })
-      ]
-    );
+    const result = await performAndLogUrlScan({
+      input_type,
+      content,
+      source,
+      client_id,
+      apiKey: req.apiKey,
+      apiUsage: req.apiUsage,
+      defaultSource: "v1_api"
+    });
 
     res.json(result);
   } catch (err) {
     console.error("Error in /v1/check:", err);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+app.post("/v1/user/check", requireUser, meterUser, async (req, res) => {
+  try {
+    const { input_type = "url", content, source, client_id } = req.body || {};
+    if (!content) return res.status(400).json({ error: "missing content" });
+
+    const userId =
+      req.user.id || req.user.user_id || req.user.sub || "unknown_user";
+
+    const result = await performAndLogUrlScan({
+      input_type,
+      content,
+      source,
+      client_id,
+      apiKey: null,
+      apiUsage: req.userUsage,
+      defaultSource: "user_api",
+      metaExtra: { user_id: userId }
+    });
+
+    res.json(result);
+  } catch (err) {
+    console.error("Error in /v1/user/check:", err);
     res.status(500).json({ error: "internal error" });
   }
 });
@@ -178,34 +311,40 @@ app.post("/api/public/check", async (req, res) => {
     const { input_type = "url", content, source, client_id } = req.body || {};
     if (!content) return res.status(400).json({ error: "missing content" });
 
-    const result = await ipqsUrlCheck(content, { strictness: 1 });
+    const ip = getClientIp(req);
+    const today = todayString();
 
-    // api_key info is null because this is public usage
-    await db.query(
-      `INSERT INTO scans
-       (input_type, content_excerpt, file_name, mime_type,
-        api_key, day_count, total_count,
-        verdict, confidence, evidence, next_steps, meta)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
-      [
-        input_type,
-        String(content).slice(0, 200),
-        null,
-        null,
-        null,
-        null,
-        null,
-        result.verdict,
-        result.confidence,
-        JSON.stringify(result.evidence),
-        JSON.stringify(result.next_steps),
-        JSON.stringify({
-          ...(result.meta || {}),
-          source: source || "public_api",
-          client_id: client_id || null
-        })
-      ]
-    );
+    let usage = publicUsage.get(ip);
+    if (!usage || usage.day !== today) {
+      usage = {
+        day: today,
+        dayCount: 0,
+        total: usage?.total ?? 0
+      };
+    }
+
+    usage.dayCount += 1;
+    usage.total += 1;
+
+    publicUsage.set(ip, usage);
+
+    if (usage.dayCount > PUBLIC_DAILY_LIMIT) {
+      return res.status(429).json({
+        error: "public daily limit exceeded",
+        dayCount: usage.dayCount,
+        limit: PUBLIC_DAILY_LIMIT
+      });
+    }
+
+    const result = await performAndLogUrlScan({
+      input_type,
+      content,
+      source,
+      client_id,
+      apiKey: null,
+      apiUsage: usage,
+      defaultSource: "public_api"
+    });
 
     res.json(result);
   } catch (err) {
