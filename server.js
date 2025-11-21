@@ -7,6 +7,8 @@ import pg from "pg";
 
 import { ipqsUrlCheck, ipqsEmailCheck } from "./ipqs.js";
 import { detectMime, extractTextFromBuffer, extractUrlsFromText } from "./ocr.js";
+import authRoutes from "./routes/auth.js";
+app.use("/auth", authRoutes);
 
 // -----------------------------------------------------------------------------
 // Config
