@@ -586,7 +586,7 @@ app.post("/v1/check_file", authAndMeter, async (req, res) => {
         client_id: client_id || null
       },
       scan_id: `file_${Date.now().toString(36)}`
-    );
+    };
 
     await db.query(
       `INSERT INTO scans
