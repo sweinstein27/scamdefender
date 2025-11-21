@@ -618,6 +618,323 @@ app.post("/v1/check_file", authAndMeter, async (req, res) => {
 });
 
 // ============================================================================
+// PUBLIC CHECK  supports url, text, email and file
+// ============================================================================
+
+app.post("/api/public/check", async (req, res) => {
+  try {
+    const {
+      input_type = "url",
+      content,
+      content_base64,
+      mime_type,
+      filename,
+      source,
+      client_id
+    } = req.body || {};
+
+    if (!input_type) {
+      return res.status(400).json({ error: "missing input_type" });
+    }
+
+    // ------------------------------------------------------------------------
+    // FILE INPUT  mirrors /v1/check_file but api_key fields are null
+    // ------------------------------------------------------------------------
+    if (input_type === "file") {
+      if (!content_base64) {
+        return res.status(400).json({ error: "missing content_base64" });
+      }
+
+      const base64 = content_base64.includes(",")
+        ? content_base64.split(",")[1]
+        : content_base64;
+
+      const buffer = Buffer.from(base64, "base64");
+
+      const mime = await detectMime(buffer, mime_type);
+
+      if (!mime.startsWith("image/") && mime !== "application/pdf") {
+        return res
+          .status(400)
+          .json({ error: `unsupported file type ${mime}` });
+      }
+
+      const text = await extractTextFromBuffer(buffer, mime);
+
+      // No text extracted
+      if (!text || !text.trim()) {
+        const response = {
+          verdict: "suspicious",
+          confidence: 0.5,
+          evidence: ["file text could not be extracted"],
+          next_steps: [
+            "verify sender using a known official contact",
+            "do not send money or codes based on this file alone"
+          ],
+          meta: {
+            provider: "ocr",
+            mime_type: mime,
+            filename: filename || null,
+            source: source || "public_api",
+            client_id: client_id || null
+          },
+          scan_id: `file_${Date.now().toString(36)}`
+        };
+
+        await db.query(
+          `INSERT INTO scans
+           (input_type, content_excerpt, file_name, mime_type,
+            api_key, day_count, total_count,
+            verdict, confidence, evidence, next_steps, meta)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [
+            "file",
+            null,
+            filename || null,
+            mime,
+            null,
+            null,
+            null,
+            response.verdict,
+            response.confidence,
+            JSON.stringify(response.evidence),
+            JSON.stringify(response.next_steps),
+            JSON.stringify(response.meta)
+          ]
+        );
+
+        return res.json(response);
+      }
+
+      // Try to extract urls from the text
+      const urls = extractUrlsFromText(text);
+
+      if (urls.length > 0) {
+        const primaryUrl = urls[0];
+
+        const ipqsResult = await ipqsUrlCheck(primaryUrl, { strictness: 1 });
+
+        const response = {
+          ...(ipqsResult.error
+            ? {
+                verdict: "suspicious",
+                confidence: 0.6,
+                evidence: [
+                  `URL detected in document: ${primaryUrl}`,
+                  `IPQS lookup failed: ${ipqsResult.error}`
+                ],
+                next_steps: [
+                  "verify sender independently",
+                  "do not click links",
+                  "open the official website manually"
+                ],
+                meta: {
+                  provider: "ocr",
+                  mime_type: mime,
+                  filename: filename || null,
+                  extracted_url_count: urls.length,
+                  source: source || "public_api",
+                  client_id: client_id || null
+                }
+              }
+            : {
+                ...ipqsResult,
+                evidence: [
+                  `file type ${mime}`,
+                  `URL extracted: ${primaryUrl}`,
+                  ...(ipqsResult.evidence || [])
+                ],
+                meta: {
+                  ...(ipqsResult.meta || {}),
+                  provider: "ocr+ipqs",
+                  mime_type: mime,
+                  filename: filename || null,
+                  extracted_url_count: urls.length,
+                  source: source || "public_api",
+                  client_id: client_id || null
+                }
+              }),
+          scan_id: `file_${Date.now().toString(36)}`
+        };
+
+        await db.query(
+          `INSERT INTO scans
+           (input_type, content_excerpt, file_name, mime_type,
+            api_key, day_count, total_count,
+            verdict, confidence, evidence, next_steps, meta)
+           VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+          [
+            "file",
+            text.slice(0, 200),
+            filename || null,
+            mime,
+            null,
+            null,
+            null,
+            response.verdict,
+            response.confidence,
+            JSON.stringify(response.evidence),
+            JSON.stringify(response.next_steps),
+            JSON.stringify(response.meta)
+          ]
+        );
+
+        return res.json(response);
+      }
+
+      // Fallback heuristic when there are no urls in the extracted text
+      const lower = text.toLowerCase();
+      const evidence = [`file type ${mime}`, "no URLs detected"];
+      let verdict = "safe";
+      let confidence = 0.7;
+
+      if (
+        lower.includes("wire transfer") ||
+        lower.includes("gift card") ||
+        lower.includes("urgent")
+      ) {
+        verdict = "likely_scam";
+        confidence = 0.92;
+        evidence.push("financial or urgency keywords detected");
+      } else if (
+        lower.includes("login") ||
+        lower.includes("password") ||
+        lower.includes("verify account")
+      ) {
+        verdict = "suspicious";
+        confidence = 0.8;
+        evidence.push("credential-related keywords detected");
+      }
+
+      const response = {
+        verdict,
+        confidence,
+        evidence,
+        next_steps:
+          verdict === "likely_scam"
+            ? [
+                "do not follow payment instructions",
+                "verify with sender independently",
+                "retain a copy for reporting"
+              ]
+            : [
+                "verify any payment or login request independently",
+                "do not share one time codes"
+              ],
+        meta: {
+          provider: "ocr",
+          mime_type: mime,
+          filename: filename || null,
+          source: source || "public_api",
+          client_id: client_id || null
+        },
+        scan_id: `file_${Date.now().toString(36)}`
+      };
+
+      await db.query(
+        `INSERT INTO scans
+         (input_type, content_excerpt, file_name, mime_type,
+          api_key, day_count, total_count,
+          verdict, confidence, evidence, next_steps, meta)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [
+          "file",
+          text.slice(0, 200),
+          filename || null,
+          mime,
+          null,
+          null,
+          null,
+          response.verdict,
+          response.confidence,
+          JSON.stringify(response.evidence),
+          JSON.stringify(response.next_steps),
+          JSON.stringify(response.meta)
+        ]
+      );
+
+      return res.json(response);
+    }
+
+    // For everything except file we require content
+    if (!content) {
+      return res.status(400).json({ error: "missing content" });
+    }
+
+    // ------------------------------------------------------------------------
+    // EMAIL INPUT  mirrors /v1/check_email
+    // ------------------------------------------------------------------------
+    if (input_type === "email") {
+      const result = await ipqsEmailCheck(content, { strictness: 1 });
+
+      await db.query(
+        `INSERT INTO scans
+         (input_type, content_excerpt, file_name, mime_type,
+          api_key, day_count, total_count,
+          verdict, confidence, evidence, next_steps, meta)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+        [
+          "email",
+          String(content).slice(0, 200),
+          null,
+          null,
+          null,
+          null,
+          null,
+          result.verdict,
+          result.confidence,
+          JSON.stringify(result.evidence),
+          JSON.stringify(result.next_steps),
+          JSON.stringify({
+            ...(result.meta || {}),
+            source: source || "public_api",
+            client_id: client_id || null
+          })
+        ]
+      );
+
+      return res.json(result);
+    }
+
+    // ------------------------------------------------------------------------
+    // URL OR TEXT INPUT  mirrors /v1/check
+    // ------------------------------------------------------------------------
+    const result = await ipqsUrlCheck(content, { strictness: 1 });
+
+    await db.query(
+      `INSERT INTO scans
+       (input_type, content_excerpt, file_name, mime_type,
+        api_key, day_count, total_count,
+        verdict, confidence, evidence, next_steps, meta)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)`,
+      [
+        input_type,
+        String(content).slice(0, 200),
+        null,
+        null,
+        null,
+        null,
+        null,
+        result.verdict,
+        result.confidence,
+        JSON.stringify(result.evidence),
+        JSON.stringify(result.next_steps),
+        JSON.stringify({
+          ...(result.meta || {}),
+          source: source || "public_api",
+          client_id: client_id || null
+        })
+      ]
+    );
+
+    return res.json(result);
+  } catch (err) {
+    console.error("Error in /api/public/check:", err);
+    res.status(500).json({ error: "internal error" });
+  }
+});
+
+// ============================================================================
 // SIMPLE ADMIN ROUTES
 // ============================================================================
 
