@@ -609,6 +609,54 @@ app.post("/api/public/check", async (req, res) => {
       });
     }
 
+    // Helper fallbacks to avoid 500s when IPQS is unavailable
+    async function safeIpqsUrl(value, opts, contextLabel) {
+      try {
+        return await ipqsUrlCheck(value, opts);
+      } catch (err) {
+        console.error("ipqsUrlCheck error in /api/public/check:", err);
+        return {
+          verdict: "suspicious",
+          confidence: 0.6,
+          evidence: [
+            `IPQS URL lookup failed${contextLabel ? ` (${contextLabel})` : ""}`
+          ],
+          next_steps: [
+            "verify the sender independently",
+            "avoid clicking links until verified",
+            "open the official website manually"
+          ],
+          meta: {
+            provider: "ipqs",
+            error: String(err),
+            url_value: value
+          }
+        };
+      }
+    }
+
+    async function safeIpqsEmail(value, opts) {
+      try {
+        return await ipqsEmailCheck(value, opts);
+      } catch (err) {
+        console.error("ipqsEmailCheck error in /api/public/check:", err);
+        return {
+          verdict: "suspicious",
+          confidence: 0.6,
+          evidence: ["IPQS email lookup failed"],
+          next_steps: [
+            "do not share codes or passwords",
+            "verify sender via a trusted contact"
+          ],
+          meta: {
+            provider: "ipqs",
+            error: String(err),
+            email_value: value
+          }
+        };
+      }
+    }
+
     // ------------------------------------------------------------------------
     // FILE INPUT  mirrors /v1/check_file but api_key fields are null
     // ------------------------------------------------------------------------
@@ -684,7 +732,7 @@ app.post("/api/public/check", async (req, res) => {
       if (urls.length > 0) {
         const primaryUrl = urls[0];
 
-        const ipqsResult = await ipqsUrlCheck(primaryUrl, { strictness: 1 });
+        const ipqsResult = await safeIpqsUrl(primaryUrl, { strictness: 1 });
 
         const response = {
           ...(ipqsResult.error
@@ -837,7 +885,7 @@ app.post("/api/public/check", async (req, res) => {
     // EMAIL INPUT  mirrors /v1/check_email
     // ------------------------------------------------------------------------
     if (input_type === "email") {
-      const result = await ipqsEmailCheck(content, { strictness: 1 });
+      const result = await safeIpqsEmail(content, { strictness: 1 });
 
       await db.query(
         `INSERT INTO scans
@@ -871,7 +919,7 @@ app.post("/api/public/check", async (req, res) => {
     // ------------------------------------------------------------------------
     // URL OR TEXT INPUT  mirrors /v1/check
     // ------------------------------------------------------------------------
-    const result = await ipqsUrlCheck(content, { strictness: 1 });
+    const result = await safeIpqsUrl(content, { strictness: 1 });
 
     await db.query(
       `INSERT INTO scans
